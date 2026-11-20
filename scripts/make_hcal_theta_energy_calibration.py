@@ -10,18 +10,20 @@ from calibration_lib import (
     add_common_args,
     apply_ecal_calibration,
     build_table_from_ratios,
-    expand_input_paths,
     find_bin,
     find_single_primary,
     flatten_index,
     get_best_cluster,
     get_cluster_energy_split,
+    iter_events,
     load_table_json,
     mcp_theta,
     parse_float_list,
     parse_int_list,
+    require_collection,
+    resolve_input_files,
+    resolve_mc_collection,
     save_table_json,
-    setup_lcio_reader,
     sum_collection_energy,
 )
 
@@ -30,7 +32,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     add_common_args(parser)
     parser.add_argument("--pdg-ids", default="2112,211,111", help="Comma-separated PDG IDs for HCAL training.")
-    parser.add_argument("--mc-collection", default="MCParticle")
+    parser.add_argument(
+        "--mc-collection",
+        default=None,
+        help="MC particle collection (default: MCParticles for edm4hep, MCParticle for lcio).",
+    )
     parser.add_argument("--energy-source", choices=["clusters", "hits"], default="clusters")
     parser.add_argument("--cluster-collection", default="PandoraClusters")
     parser.add_argument("--ecal-subdet-index", type=int, default=0)
@@ -84,9 +90,10 @@ def main() -> int:
     theta_edges = parse_float_list(args.theta_bins)
     energy_edges = parse_float_list(args.energy_bins)
     pdg_ids = parse_int_list(args.pdg_ids)
-    files = expand_input_paths(args.inputs, args.file_glob, recursive=args.recursive)
+    files, input_format = resolve_input_files(args.inputs, args.input_format, args.file_glob, args.recursive)
     if not files:
         raise RuntimeError("No input files found.")
+    mc_collection = resolve_mc_collection(args.mc_collection, input_format)
 
     if args.energy_basis == "raw" and not args.ecal_calibration:
         raise RuntimeError("--ecal-calibration is required when --energy-basis raw.")
@@ -95,16 +102,14 @@ def main() -> int:
     n_energy = len(energy_edges) - 1
     ratios_per_bin = [[] for _ in range(n_theta * n_energy)]
 
-    reader = setup_lcio_reader(
-        [
-            args.mc_collection,
-            args.cluster_collection,
-            args.ecal_barrel_collection,
-            args.ecal_endcap_collection,
-            args.hcal_barrel_collection,
-            args.hcal_endcap_collection,
-        ]
-    )
+    collection_names = [
+        mc_collection,
+        args.cluster_collection,
+        args.ecal_barrel_collection,
+        args.ecal_endcap_collection,
+        args.hcal_barrel_collection,
+        args.hcal_endcap_collection,
+    ]
 
     events_total = 0
     events_used = 0
@@ -112,80 +117,75 @@ def main() -> int:
     events_skipped_fraction = 0
     t0 = time.time()
 
-    for fname in files:
-        reader.open(fname)
-        for event in reader:
-            if args.max_events > 0 and events_total >= args.max_events:
-                break
-            events_total += 1
-
-            mcp = find_single_primary(
-                event.getCollection(args.mc_collection),
-                pdg_ids=pdg_ids,
-                eta_max=args.eta_max,
-                require_single=args.require_single_primary,
-            )
-            if mcp is None:
-                continue
-
-            truth_e = mcp.getEnergy()
-            theta = mcp_theta(mcp)
-            if args.energy_source == "clusters":
-                cluster = get_best_cluster(event, args.cluster_collection)
-                if cluster is None:
-                    continue
-                total, ecal_e, hcal_e, has_split = get_cluster_energy_split(
-                    cluster, ecal_index=args.ecal_subdet_index, hcal_index=args.hcal_subdet_index
-                )
-                if args.skip_missing_subdet_split and not has_split:
-                    events_skipped_split += 1
-                    continue
-                hcal_fraction = (hcal_e / total) if total > 0.0 else 0.0
-                if hcal_fraction < args.hcal_fraction_min:
-                    events_skipped_fraction += 1
-                    continue
-                ecal_measured = ecal_e
-                hcal_measured = hcal_e
-            else:
-                ecal_measured = (
-                    sum_collection_energy(event, args.ecal_barrel_collection)
-                    + sum_collection_energy(event, args.ecal_endcap_collection)
-                )
-                hcal_measured = (
-                    sum_collection_energy(event, args.hcal_barrel_collection)
-                    + sum_collection_energy(event, args.hcal_endcap_collection)
-                )
-            if hcal_measured <= 0.0:
-                continue
-
-            if args.energy_basis == "hadronic":
-                measured_energy = ecal_measured * args.ecal_to_had_gev + hcal_measured * args.hcal_to_had_gev
-                if measured_energy <= 0.0:
-                    continue
-                ratio = truth_e / measured_energy
-                energy_axis_value = measured_energy
-            else:
-                ecal_corrected = apply_ecal_calibration(ecal_table, theta, ecal_measured)
-                target_hcal = truth_e - ecal_corrected
-                if target_hcal <= 0.0:
-                    if args.negative_target_policy == "skip":
-                        continue
-                    target_hcal = 0.0
-                if target_hcal <= 0.0:
-                    continue
-
-                ratio = target_hcal / hcal_measured
-                energy_axis_value = hcal_measured
-
-            i_theta = find_bin(theta_edges, theta)
-            i_energy = find_bin(energy_edges, energy_axis_value)
-            if i_theta < 0 or i_energy < 0:
-                continue
-            ratios_per_bin[flatten_index(i_theta, i_energy, n_energy)].append(ratio)
-            events_used += 1
-        reader.close()
+    for event in iter_events(files, input_format, collection_names):
         if args.max_events > 0 and events_total >= args.max_events:
             break
+        events_total += 1
+
+        mcp = find_single_primary(
+            require_collection(event, mc_collection),
+            pdg_ids=pdg_ids,
+            eta_max=args.eta_max,
+            require_single=args.require_single_primary,
+        )
+        if mcp is None:
+            continue
+
+        truth_e = mcp.getEnergy()
+        theta = mcp_theta(mcp)
+        if args.energy_source == "clusters":
+            cluster = get_best_cluster(event, args.cluster_collection)
+            if cluster is None:
+                continue
+            total, ecal_e, hcal_e, has_split = get_cluster_energy_split(
+                cluster, ecal_index=args.ecal_subdet_index, hcal_index=args.hcal_subdet_index
+            )
+            if args.skip_missing_subdet_split and not has_split:
+                events_skipped_split += 1
+                continue
+            hcal_fraction = (hcal_e / total) if total > 0.0 else 0.0
+            if hcal_fraction < args.hcal_fraction_min:
+                events_skipped_fraction += 1
+                continue
+            ecal_measured = ecal_e
+            hcal_measured = hcal_e
+        else:
+            ecal_measured = (
+                sum_collection_energy(event, args.ecal_barrel_collection)
+                + sum_collection_energy(event, args.ecal_endcap_collection)
+            )
+            hcal_measured = (
+                sum_collection_energy(event, args.hcal_barrel_collection)
+                + sum_collection_energy(event, args.hcal_endcap_collection)
+            )
+        if hcal_measured <= 0.0:
+            continue
+
+        if args.energy_basis == "hadronic":
+            measured_energy = ecal_measured * args.ecal_to_had_gev + hcal_measured * args.hcal_to_had_gev
+            if measured_energy <= 0.0:
+                continue
+            ratio = truth_e / measured_energy
+            energy_axis_value = measured_energy
+        else:
+            ecal_corrected = apply_ecal_calibration(ecal_table, theta, ecal_measured)
+            target_hcal = truth_e - ecal_corrected
+            if target_hcal <= 0.0:
+                if args.negative_target_policy == "skip":
+                    continue
+                target_hcal = 0.0
+            if target_hcal <= 0.0:
+                continue
+
+            ratio = target_hcal / hcal_measured
+            energy_axis_value = hcal_measured
+
+        i_theta = find_bin(theta_edges, theta)
+        i_energy = find_bin(energy_edges, energy_axis_value)
+        if i_theta < 0 or i_energy < 0:
+            continue
+        ratios_per_bin[flatten_index(i_theta, i_energy, n_energy)].append(ratio)
+        events_used += 1
 
     table = build_table_from_ratios(
         domain="HADRONIC" if args.energy_basis == "hadronic" else "HCAL",
@@ -203,7 +203,8 @@ def main() -> int:
             "events_skipped_split": events_skipped_split,
             "events_skipped_fraction": events_skipped_fraction,
             "pdg_ids": pdg_ids,
-            "mc_collection": args.mc_collection,
+            "input_format": input_format,
+            "mc_collection": mc_collection,
             "energy_source": args.energy_source,
             "cluster_collection": args.cluster_collection,
             "ecal_subdet_index": args.ecal_subdet_index,

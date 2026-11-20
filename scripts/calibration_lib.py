@@ -264,6 +264,76 @@ def combine_branch_ddmarlin_params(
     }
 
 
+INPUT_FORMATS = ("auto", "edm4hep", "lcio")
+
+# Per-format defaults, used when --file-glob or --mc-collection is not given.
+FORMAT_DEFAULTS = {
+    "edm4hep": {"file_glob": "*.edm4hep.root", "mc_collection": "MCParticles"},
+    "lcio": {"file_glob": "*.slcio", "mc_collection": "MCParticle"},
+}
+
+
+def add_input_format_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--input-format",
+        choices=INPUT_FORMATS,
+        default="auto",
+        help="Input file format. 'auto' decides from the file extensions (.slcio = lcio, .root = edm4hep).",
+    )
+
+
+def detect_input_format(files: Sequence[str]) -> str:
+    """Return 'lcio' or 'edm4hep' from the file extensions; all files must share one format."""
+    formats = set()
+    for fname in files:
+        if fname.endswith(".slcio"):
+            formats.add("lcio")
+        elif fname.endswith(".root"):
+            formats.add("edm4hep")
+        else:
+            raise RuntimeError(f"Cannot tell the format of {fname} from its extension; pass --input-format.")
+    if len(formats) != 1:
+        raise RuntimeError(f"Input files mix formats {sorted(formats)}; give one format per input list.")
+    return formats.pop()
+
+
+def resolve_input_files(
+    inputs: Sequence[str], input_format: str, file_glob, recursive: bool
+) -> Tuple[List[str], str]:
+    """
+    Expand the inputs into files and decide their format.
+
+    Without --file-glob, directories are searched with the glob of the chosen format, or with
+    both formats' globs when the format is 'auto'. Returns (files, format); the format is None
+    when no files are found and the format is 'auto'.
+    """
+    if file_glob:
+        files = expand_input_paths(inputs, file_glob, recursive=recursive)
+    elif input_format != "auto":
+        files = expand_input_paths(inputs, FORMAT_DEFAULTS[input_format]["file_glob"], recursive=recursive)
+    else:
+        files = sorted(
+            set(
+                f
+                for defaults in FORMAT_DEFAULTS.values()
+                for f in expand_input_paths(inputs, defaults["file_glob"], recursive=recursive)
+            )
+        )
+
+    if input_format != "auto":
+        return files, input_format
+    if not files:
+        return files, None
+    return files, detect_input_format(files)
+
+
+def resolve_mc_collection(mc_collection, input_format: str) -> str:
+    """Return the requested MC collection name, or the default name for the input format."""
+    if mc_collection:
+        return mc_collection
+    return FORMAT_DEFAULTS[input_format]["mc_collection"]
+
+
 def setup_lcio_reader(collection_names: Sequence[str]):
     try:
         import pyLCIO  # type: ignore
@@ -274,11 +344,70 @@ def setup_lcio_reader(collection_names: Sequence[str]):
     return reader
 
 
-def mcp_eta(mcp) -> float:
+def iter_events(files: Sequence[str], input_format: str, collection_names: Sequence[str] = ()):
+    """
+    Yield the events of all files in order: LCIO LCEvent objects or podio Frame objects.
+    Use get_collection / require_collection to read collections from either kind.
+    collection_names limits which collections are read; it is only used for LCIO.
+    """
+    if not files:
+        return
+    if input_format == "lcio":
+        reader = setup_lcio_reader(collection_names)
+        for fname in files:
+            reader.open(fname)
+            try:
+                for event in reader:
+                    yield event
+            finally:
+                reader.close()
+    elif input_format == "edm4hep":
+        try:
+            from podio.root_io import Reader  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("podio is required for EDM4hep input but is not available in this environment") from exc
+        yield from Reader(list(files)).get("events")
+    else:
+        raise ValueError(f"Unknown input format: {input_format}")
+
+
+def get_collection(event, name: str):
+    """Return the named collection of an LCIO event or podio frame, or None if it is absent."""
+    try:
+        if hasattr(event, "getCollection"):
+            return event.getCollection(name)
+        return event.get(name)
+    except Exception:
+        return None
+
+
+def require_collection(event, name: str):
+    """Return the named collection, raising an error that names it if it is absent."""
+    collection = get_collection(event, name)
+    if collection is None:
+        raise RuntimeError(f"Collection '{name}' not found in event; check --mc-collection / --input-format.")
+    return collection
+
+
+def collection_elements(collection):
+    """Iterate over the elements of an LCIO LCCollection or a podio collection."""
+    if hasattr(collection, "getNumberOfElements"):
+        for i in range(collection.getNumberOfElements()):
+            yield collection.getElementAt(i)
+    else:
+        yield from collection
+
+
+def _momentum_xyz(mcp) -> Tuple[float, float, float]:
+    """Return (px, py, pz). LCIO returns an indexable array; EDM4hep returns a Vector3d with x, y, z."""
     momentum = mcp.getMomentum()
-    px = float(momentum[0])
-    py = float(momentum[1])
-    pz = float(momentum[2])
+    if hasattr(momentum, "x"):
+        return float(momentum.x), float(momentum.y), float(momentum.z)
+    return float(momentum[0]), float(momentum[1]), float(momentum[2])
+
+
+def mcp_eta(mcp) -> float:
+    px, py, pz = _momentum_xyz(mcp)
     p = math.sqrt(px * px + py * py + pz * pz)
     if p <= 0.0:
         return 999.0
@@ -291,11 +420,8 @@ def mcp_eta(mcp) -> float:
 
 
 def mcp_theta(mcp) -> float:
-    momentum = mcp.getMomentum()
-    px = float(momentum[0])
-    py = float(momentum[1])
-    pz = float(momentum[2])
-    p = math.sqrt(px * px + py * py + pz * pz)
+    px, py, pz = _momentum_xyz(mcp)
+    p =math.sqrt(px * px + py * py + pz * pz)
     if p <= 0.0:
         return 0.0
     cos_theta = max(-1.0, min(1.0, pz / p))
@@ -309,7 +435,7 @@ def find_single_primary(
     require_single: bool,
 ):
     matches = []
-    for mcp in mcp_collection:
+    for mcp in collection_elements(mcp_collection):
         if mcp.getGeneratorStatus() != 1:
             continue
         if abs(mcp.getPDG()) not in pdg_ids:
@@ -326,24 +452,19 @@ def find_single_primary(
 
 
 def sum_collection_energy(event, name: str) -> float:
-    try:
-        collection = event.getCollection(name)
-    except Exception:
+    collection = get_collection(event, name)
+    if collection is None:
         return 0.0
-    return sum(hit.getEnergy() for hit in collection)
+    return sum(hit.getEnergy() for hit in collection_elements(collection))
 
 
 def get_best_cluster(event, cluster_collection: str):
-    try:
-        collection = event.getCollection(cluster_collection)
-    except Exception:
-        return None
-    if collection.getNumberOfElements() <= 0:
+    collection = get_collection(event, cluster_collection)
+    if collection is None:
         return None
     best = None
     best_energy = -1.0
-    for i in range(collection.getNumberOfElements()):
-        cluster = collection.getElementAt(i)
+    for cluster in collection_elements(collection):
         energy = float(cluster.getEnergy())
         if energy > best_energy:
             best_energy = energy
@@ -379,7 +500,13 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         required=True,
         help="Input files/directories/globs. Directories are expanded with --file-glob.",
     )
-    parser.add_argument("--file-glob", default="*.slcio", help="Glob used when an input is a directory.")
+    parser.add_argument(
+        "--file-glob",
+        default=None,
+        help="Glob used when an input is a directory (default: *.edm4hep.root for edm4hep, *.slcio for lcio, "
+        "both for auto).",
+    )
+    add_input_format_args(parser)
     parser.add_argument(
         "--recursive",
         action="store_true",

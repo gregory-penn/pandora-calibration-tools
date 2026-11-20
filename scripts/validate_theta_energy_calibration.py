@@ -11,16 +11,19 @@ import statistics
 import time
 
 from calibration_lib import (
+    add_input_format_args,
     apply_ecal_calibration,
     apply_hadronic_calibration,
-    expand_input_paths,
     find_single_primary,
     get_best_cluster,
     get_cluster_energy_split,
+    iter_events,
     load_table_json,
     mcp_theta,
     parse_int_list,
-    setup_lcio_reader,
+    require_collection,
+    resolve_input_files,
+    resolve_mc_collection,
     sum_collection_energy,
 )
 
@@ -153,12 +156,22 @@ def main() -> int:
     parser.add_argument("--inputs", nargs="+", default=[], help="Fallback inputs used for both ECAL and HCAL validation.")
     parser.add_argument("--ecal-inputs", nargs="+", default=[], help="Inputs used for ECAL closure validation.")
     parser.add_argument("--hcal-inputs", nargs="+", default=[], help="Inputs used for HCAL and total closure validation.")
-    parser.add_argument("--file-glob", default="*.slcio")
+    parser.add_argument(
+        "--file-glob",
+        default=None,
+        help="Glob used when an input is a directory (default: *.edm4hep.root for edm4hep, *.slcio for lcio, "
+        "both for auto).",
+    )
+    add_input_format_args(parser)
     parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--max-events", type=int, default=-1)
     parser.add_argument("--eta-max", type=float, default=2.436)
     parser.add_argument("--require-single-primary", action="store_true")
-    parser.add_argument("--mc-collection", default="MCParticle")
+    parser.add_argument(
+        "--mc-collection",
+        default=None,
+        help="MC particle collection (default: MCParticles for edm4hep, MCParticle for lcio).",
+    )
     parser.add_argument("--energy-source", choices=["clusters", "hits"], default="clusters")
     parser.add_argument("--cluster-collection", default="PandoraClusters")
     parser.add_argument("--ecal-subdet-index", type=int, default=0)
@@ -186,8 +199,8 @@ def main() -> int:
     if not ecal_inputs and not hcal_inputs:
         raise RuntimeError("No input paths provided. Use --inputs or --ecal-inputs/--hcal-inputs.")
 
-    ecal_files = expand_input_paths(ecal_inputs, args.file_glob, recursive=args.recursive)
-    hcal_files = expand_input_paths(hcal_inputs, args.file_glob, recursive=args.recursive)
+    ecal_files, ecal_format = resolve_input_files(ecal_inputs, args.input_format, args.file_glob, args.recursive)
+    hcal_files, hcal_format = resolve_input_files(hcal_inputs, args.input_format, args.file_glob, args.recursive)
     if not ecal_files and args.ecal_calibration:
         raise RuntimeError("No ECAL input files found.")
     if not hcal_files:
@@ -203,17 +216,16 @@ def main() -> int:
     hadronic_table = load_table_json(args.hadronic_calibration) if args.hadronic_calibration else None
     ecal_pdgs = parse_int_list(args.ecal_pdg_ids)
     hcal_pdgs = parse_int_list(args.hcal_pdg_ids)
+    ecal_mc_collection = resolve_mc_collection(args.mc_collection, ecal_format) if ecal_format else None
+    hcal_mc_collection = resolve_mc_collection(args.mc_collection, hcal_format) if hcal_format else None
 
-    reader = setup_lcio_reader(
-        [
-            args.mc_collection,
-            args.cluster_collection,
-            args.ecal_barrel_collection,
-            args.ecal_endcap_collection,
-            args.hcal_barrel_collection,
-            args.hcal_endcap_collection,
-        ]
-    )
+    collection_names = [
+        args.cluster_collection,
+        args.ecal_barrel_collection,
+        args.ecal_endcap_collection,
+        args.hcal_barrel_collection,
+        args.hcal_endcap_collection,
+    ]
 
     events_total_ecal = 0
     events_total_hcal = 0
@@ -224,98 +236,88 @@ def main() -> int:
     t0 = time.time()
 
     ecal_validation_files = ecal_files if ecal_table else []
-    for fname in ecal_validation_files:
-        reader.open(fname)
-        for event in reader:
-            if args.max_events > 0 and events_total_ecal >= args.max_events:
-                break
-            events_total_ecal += 1
-
-            if args.energy_source == "clusters":
-                cluster = get_best_cluster(event, args.cluster_collection)
-                if cluster is None:
-                    continue
-                total, ecal_e, _hcal_e, has_split = get_cluster_energy_split(
-                    cluster, ecal_index=args.ecal_subdet_index, hcal_index=args.hcal_subdet_index
-                )
-                if args.skip_missing_subdet_split and not has_split:
-                    continue
-                ecal_measured = ecal_e
-            else:
-                ecal_measured = (
-                    sum_collection_energy(event, args.ecal_barrel_collection)
-                    + sum_collection_energy(event, args.ecal_endcap_collection)
-                )
-
-            mcp_ecal = find_single_primary(
-                event.getCollection(args.mc_collection),
-                pdg_ids=ecal_pdgs,
-                eta_max=args.eta_max,
-                require_single=args.require_single_primary,
-            )
-            if mcp_ecal is not None and ecal_measured > 0.0:
-                truth_e = mcp_ecal.getEnergy()
-                theta = mcp_theta(mcp_ecal)
-                ecal_corr = apply_ecal_calibration(ecal_table, theta, ecal_measured)
-                if ecal_corr > 0.0:
-                    ecal_closure.append(truth_e / ecal_corr)
-        reader.close()
+    for event in iter_events(ecal_validation_files, ecal_format, collection_names + [ecal_mc_collection]):
         if args.max_events > 0 and events_total_ecal >= args.max_events:
             break
+        events_total_ecal += 1
 
-    for fname in hcal_files:
-        reader.open(fname)
-        for event in reader:
-            if args.max_events > 0 and events_total_hcal >= args.max_events:
-                break
-            events_total_hcal += 1
-
-            if args.energy_source == "clusters":
-                cluster = get_best_cluster(event, args.cluster_collection)
-                if cluster is None:
-                    continue
-                _total, ecal_e, hcal_e, has_split = get_cluster_energy_split(
-                    cluster, ecal_index=args.ecal_subdet_index, hcal_index=args.hcal_subdet_index
-                )
-                if args.skip_missing_subdet_split and not has_split:
-                    continue
-                ecal_measured = ecal_e
-                hcal_measured = hcal_e
-            else:
-                ecal_measured = (
-                    sum_collection_energy(event, args.ecal_barrel_collection)
-                    + sum_collection_energy(event, args.ecal_endcap_collection)
-                )
-                hcal_measured = (
-                    sum_collection_energy(event, args.hcal_barrel_collection)
-                    + sum_collection_energy(event, args.hcal_endcap_collection)
-                )
-            mcp_hcal = find_single_primary(
-                event.getCollection(args.mc_collection),
-                pdg_ids=hcal_pdgs,
-                eta_max=args.eta_max,
-                require_single=args.require_single_primary,
+        if args.energy_source == "clusters":
+            cluster = get_best_cluster(event, args.cluster_collection)
+            if cluster is None:
+                continue
+            total, ecal_e, _hcal_e, has_split = get_cluster_energy_split(
+                cluster, ecal_index=args.ecal_subdet_index, hcal_index=args.hcal_subdet_index
             )
-            if mcp_hcal is not None and hcal_measured > 0.0:
-                truth_e = mcp_hcal.getEnergy()
-                theta = mcp_theta(mcp_hcal)
-                if hadronic_table:
-                    hadronic_corr = apply_hadronic_calibration(hadronic_table, theta, ecal_measured, hcal_measured)
-                    if hadronic_corr > 0.0:
-                        hadronic_closure.append(truth_e / hadronic_corr)
-                else:
-                    ecal_corr = apply_ecal_calibration(ecal_table, theta, ecal_measured)
-                    target_hcal = truth_e - ecal_corr
-                    if target_hcal > 0.0:
-                        hcal_corr = hcal_table.lookup(theta, hcal_measured) * hcal_measured
-                        if hcal_corr > 0.0:
-                            hcal_closure.append(target_hcal / hcal_corr)
-                    total_corr = ecal_corr + hcal_table.lookup(theta, hcal_measured) * hcal_measured
-                    if total_corr > 0.0:
-                        total_closure.append(truth_e / total_corr)
-        reader.close()
+            if args.skip_missing_subdet_split and not has_split:
+                continue
+            ecal_measured = ecal_e
+        else:
+            ecal_measured = (
+                sum_collection_energy(event, args.ecal_barrel_collection)
+                + sum_collection_energy(event, args.ecal_endcap_collection)
+            )
+
+        mcp_ecal = find_single_primary(
+            require_collection(event, ecal_mc_collection),
+            pdg_ids=ecal_pdgs,
+            eta_max=args.eta_max,
+            require_single=args.require_single_primary,
+        )
+        if mcp_ecal is not None and ecal_measured > 0.0:
+            truth_e = mcp_ecal.getEnergy()
+            theta = mcp_theta(mcp_ecal)
+            ecal_corr = apply_ecal_calibration(ecal_table, theta, ecal_measured)
+            if ecal_corr > 0.0:
+                ecal_closure.append(truth_e / ecal_corr)
+
+    for event in iter_events(hcal_files, hcal_format, collection_names + [hcal_mc_collection]):
         if args.max_events > 0 and events_total_hcal >= args.max_events:
             break
+        events_total_hcal += 1
+
+        if args.energy_source == "clusters":
+            cluster = get_best_cluster(event, args.cluster_collection)
+            if cluster is None:
+                continue
+            _total, ecal_e, hcal_e, has_split = get_cluster_energy_split(
+                cluster, ecal_index=args.ecal_subdet_index, hcal_index=args.hcal_subdet_index
+            )
+            if args.skip_missing_subdet_split and not has_split:
+                continue
+            ecal_measured = ecal_e
+            hcal_measured = hcal_e
+        else:
+            ecal_measured = (
+                sum_collection_energy(event, args.ecal_barrel_collection)
+                + sum_collection_energy(event, args.ecal_endcap_collection)
+            )
+            hcal_measured = (
+                sum_collection_energy(event, args.hcal_barrel_collection)
+                + sum_collection_energy(event, args.hcal_endcap_collection)
+            )
+        mcp_hcal = find_single_primary(
+            require_collection(event, hcal_mc_collection),
+            pdg_ids=hcal_pdgs,
+            eta_max=args.eta_max,
+            require_single=args.require_single_primary,
+        )
+        if mcp_hcal is not None and hcal_measured > 0.0:
+            truth_e = mcp_hcal.getEnergy()
+            theta = mcp_theta(mcp_hcal)
+            if hadronic_table:
+                hadronic_corr = apply_hadronic_calibration(hadronic_table, theta, ecal_measured, hcal_measured)
+                if hadronic_corr > 0.0:
+                    hadronic_closure.append(truth_e / hadronic_corr)
+            else:
+                ecal_corr = apply_ecal_calibration(ecal_table, theta, ecal_measured)
+                target_hcal = truth_e - ecal_corr
+                if target_hcal > 0.0:
+                    hcal_corr = hcal_table.lookup(theta, hcal_measured) * hcal_measured
+                    if hcal_corr > 0.0:
+                        hcal_closure.append(target_hcal / hcal_corr)
+                total_corr = ecal_corr + hcal_table.lookup(theta, hcal_measured) * hcal_measured
+                if total_corr > 0.0:
+                    total_closure.append(truth_e / total_corr)
 
     summary = {
         "created_unix": int(time.time()),
@@ -331,6 +333,10 @@ def main() -> int:
         "inputs": {
             "ecal_inputs": ecal_inputs,
             "hcal_inputs": hcal_inputs,
+            "ecal_input_format": ecal_format,
+            "hcal_input_format": hcal_format,
+            "ecal_mc_collection": ecal_mc_collection,
+            "hcal_mc_collection": hcal_mc_collection,
             "ecal_calibration": args.ecal_calibration,
             "hcal_calibration": args.hcal_calibration,
             "hadronic_calibration": args.hadronic_calibration,
